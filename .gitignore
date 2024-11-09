@@ -1,0 +1,27 @@
+# Windows
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Go
+/vendor/
+/bin/
+/pkg/
+*.test
+*.out
+go.sum
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 日志文件
+*.log
+
+# 系统文件
+.DS_Store
+Thumbs.db
