@@ -9,8 +9,12 @@ import (
 
 // ProfileConfig 定义每个 profile 的配置
 type ProfileConfig struct {
-	TotalQuota  int64  // profile 总配额
-	Description string // profile 描述
+	TotalQuota        int64                    // profile 总配额
+	RateLimit         int64                    // 每秒最大请求数
+	Burst             int64                    // 突发请求数
+	Description       string                   // profile 描述
+	Window            time.Duration            // 速率窗口大小
+	RateControlMethod common.RateControlMethod // 速率控制方法
 }
 
 // QuotaManager 支持多 profile 的配额管理器
@@ -22,16 +26,13 @@ type QuotaManager struct {
 
 // ProfileManager 单个 profile 的配额管理器
 type ProfileManager struct {
-	profileID  int
-	totalQuota int64
-	usedQuota  int64
-	nodeQuotas map[string]*NodeQuota
-}
-
-// NodeQuota 节点在某个 profile 下的配额信息
-type NodeQuota struct {
-	allocated int64
-	lastCheck time.Time
+	profileID      int
+	totalQuota     int64
+	usedQuota      int64
+	config         ProfileConfig
+	lastWindowTime time.Time
+	rateTokens     int64
+	requestCount   int64
 }
 
 // NewQuotaManager 创建配额管理器
@@ -46,7 +47,7 @@ func NewQuotaManager(refreshInterval time.Duration, profileConfigs map[int]Profi
 		qm.profiles[profileID] = &ProfileManager{
 			profileID:  profileID,
 			totalQuota: config.TotalQuota,
-			nodeQuotas: make(map[string]*NodeQuota),
+			config:     config,
 		}
 	}
 
@@ -62,6 +63,7 @@ func (qm *QuotaManager) CheckQuota(req common.QuotaRequest) common.QuotaResponse
 	defer qm.mu.Unlock()
 
 	responses := make([]common.ProfileQuotaResponse, 0, len(req.Quotas))
+	now := time.Now()
 
 	// 处理每个 profile 的请求
 	for _, profileQuota := range req.Quotas {
@@ -76,13 +78,47 @@ func (qm *QuotaManager) CheckQuota(req common.QuotaRequest) common.QuotaResponse
 			continue
 		}
 
-		// 获取或创建节点配额信息
-		nodeQuota, exists := profileMgr.nodeQuotas[req.NodeID]
-		if !exists {
-			nodeQuota = &NodeQuota{
-				lastCheck: time.Now(),
+		// 全局速率控制
+		elapsed := now.Sub(profileMgr.lastWindowTime)
+		switch profileMgr.config.RateControlMethod {
+		case common.RateControlTokenBucket:
+			// 令牌桶算法
+			if elapsed > profileMgr.config.Window {
+				profileMgr.rateTokens = profileMgr.config.Burst
+				profileMgr.lastWindowTime = now
 			}
-			profileMgr.nodeQuotas[req.NodeID] = nodeQuota
+
+			newTokens := int64(elapsed.Seconds() * float64(profileMgr.config.RateLimit))
+			profileMgr.rateTokens = min(profileMgr.rateTokens+newTokens, profileMgr.config.Burst)
+
+			if profileMgr.rateTokens < 1 {
+				responses = append(responses, common.ProfileQuotaResponse{
+					ProfileID:   profileQuota.ProfileID,
+					Granted:     0,
+					Required:    profileQuota.Required,
+					RateLimited: true,
+				})
+				continue
+			}
+			profileMgr.rateTokens--
+
+		case common.RateControlFixedWindow:
+			// 固定窗口算法
+			if elapsed > profileMgr.config.Window {
+				profileMgr.requestCount = 0
+				profileMgr.lastWindowTime = now
+			}
+
+			if profileMgr.requestCount >= profileMgr.config.RateLimit {
+				responses = append(responses, common.ProfileQuotaResponse{
+					ProfileID:   profileQuota.ProfileID,
+					Granted:     0,
+					Required:    profileQuota.Required,
+					RateLimited: true,
+				})
+				continue
+			}
+			profileMgr.requestCount++
 		}
 
 		// 计算可用配额
@@ -94,9 +130,7 @@ func (qm *QuotaManager) CheckQuota(req common.QuotaRequest) common.QuotaResponse
 
 		// 更新配额信息
 		if grantedQuota > 0 {
-			nodeQuota.allocated += grantedQuota
 			profileMgr.usedQuota += grantedQuota
-			nodeQuota.lastCheck = time.Now()
 		}
 
 		responses = append(responses, common.ProfileQuotaResponse{
@@ -131,9 +165,6 @@ func (qm *QuotaManager) refresh() {
 	// 刷新每个 profile 的配额
 	for _, profileMgr := range qm.profiles {
 		profileMgr.usedQuota = 0
-		for _, quota := range profileMgr.nodeQuotas {
-			quota.allocated = 0
-		}
 	}
 }
 
@@ -151,13 +182,6 @@ func (qm *QuotaManager) GetQuotaStatus() map[string]interface{} {
 			"used_quota":  profileMgr.usedQuota,
 			"available":   profileMgr.totalQuota - profileMgr.usedQuota,
 			"nodes":       make(map[string]interface{}),
-		}
-
-		for nodeID, quota := range profileMgr.nodeQuotas {
-			profileStatus["nodes"].(map[string]interface{})[nodeID] = map[string]interface{}{
-				"allocated": quota.allocated,
-				"lastCheck": quota.lastCheck,
-			}
 		}
 
 		profiles[fmt.Sprintf("profile_%d", profileID)] = profileStatus

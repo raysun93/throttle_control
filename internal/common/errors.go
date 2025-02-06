@@ -10,4 +10,5 @@ var (
 	ErrInvalidRequest = errors.New("invalid request")
 	ErrQuotaExceeded  = errors.New("quota exceeded")
 	ErrNodeNotFound   = errors.New("node not found")
+	ErrRateLimited    = errors.New("rate limited")
 )
